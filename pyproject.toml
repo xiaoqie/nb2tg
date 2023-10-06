@@ -1,0 +1,18 @@
+[project]
+name = "nb2tg"
+version = "0.1.0"
+description = "nb2tg"
+readme = "README.md"
+requires-python = ">=3.8, <4.0"
+dependencies = [
+  'python-telegram-bot',
+]
+
+[tool.nonebot]
+adapters = [
+    { name = "OneBot V12", module_name = "nonebot.adapters.onebot.v12" },
+    { name = "RedProtocol", module_name = "nonebot.adapters.red" }
+]
+plugins = ["nonebot_plugin_localstore"]
+plugin_dirs = []
+builtin_plugins = []
