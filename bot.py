@@ -1,258 +1,310 @@
 import asyncio
-import html
-from io import BytesIO
 import json
-from pathlib import Path
-from pprint import pprint
+import time
+import urllib.request
+import traceback
+import imageio.v3 as iio
 import nonebot
-from nonebot import on, on_message, logger
-from nonebot.adapters.red import Adapter, Message, MessageEvent, Bot, MessageSegment
-from nonebot.adapters.red.api.model import ChatType
-import telegram
-from telegram import Update, InputMediaPhoto, InputMediaDocument, InputMediaAudio, InputMediaVideo
-from telegram.ext import ContextTypes, filters
-from telegram_app import TelegramApp
-from database import DBForumTopic, DBMessage, Database
+from nonebot import on, on_command, logger
+from nonebot.rule import is_type
+from nonebot.params import CommandArg
+import nonebot.adapters.onebot.v11 as v11
+import nonebot.adapters.telegram as tg
+import database as DB
+from utils import qq_emoji_text_list, download_file
 
 nonebot.init()
 driver = nonebot.get_driver()
-driver.register_adapter(Adapter)
+driver.register_adapter(v11.Adapter)
+driver.register_adapter(tg.Adapter)
 nonebot.load_from_toml("pyproject.toml")
 
-import nonebot_plugin_localstore as store
-
+db = DB.Database("nb2tg.db")
 forum_topic_lock = asyncio.Lock()
-db = Database(store.get_config_file("nb2tg", "nb2tg.db"))
+group_list_lock = asyncio.Lock()
+_group_list = {}
+tg_bots_last_message_timestamp = {}
+
+
+def telegram_master():
+    b: tg.Bot = next(bot for bot in nonebot.get_bots().values() if bot.type == "Telegram")
+    return b
+
+
+def is_telegram_master(bot: tg.Bot):
+    return bot is telegram_master()
+
+
+def v11_bot() -> v11.Bot:
+    return next(bot for bot in nonebot.get_bots().values() if bot.type == "OneBot V11")
+
+
+def telegram_load_balance(force_bot_id: int = None):
+    if force_bot_id:
+        return nonebot.get_bot(str(force_bot_id))
+
+    b: tg.Bot = sorted(filter(lambda bot: bot.type == "Telegram", nonebot.get_bots().values()), 
+                       key=lambda bot: tg_bots_last_message_timestamp.get(bot.self_id, 0))[0]
+    tg_bots_last_message_timestamp[b.self_id] = time.time()
+    return b
+
 
 async def get_forum_topic(unique_id: int, name: str):
     async with forum_topic_lock:
-        unique_id = str(unique_id)
-        forum_topic_id = db.select_tg_forum_topic_id(unique_id)
+        forum_topic_id = db.select_tg_forum_topic_id(qq_unique_id=unique_id)
         if not forum_topic_id:
-            logger.info(f"creating forum topic for {name}")
-            forum_topic = await telegram_master().create_forum_topic(name)
-            logger.info(f"forum topic {name} created")
+            logger.info(f"creating forum topic for {unique_id} {name}")
+            forum_topic = await telegram_master().create_forum_topic(driver.config.chat_id, name)
             forum_topic_id = forum_topic.message_thread_id
-            db.insert_forum_topic(DBForumTopic(forum_topic_id, unique_id))
+            logger.info(f"forum topic {forum_topic_id} created")
+            db.insert_forum_topic(DB.ForumTopic(forum_topic_id, unique_id))
         return forum_topic_id
 
 
-async def convert_message(message: Message):
+async def get_group_info(bot: v11.Bot, group_id: int):
+    async with group_list_lock:
+        if group_id not in _group_list:
+            group_list = await bot.call_api("get_group_list")
+            for group in group_list:
+                _group_list[group['group_id']] = group
+        return _group_list[group_id]
+
+
+async def convert_message(message: v11.Message):
+    entities = ""
     text = ""
-    media = []
     for seg in message:
-        match seg.type:
-            case "text":
-                text += html.escape(seg.data['text'])
-            case "at":
-                text += f'<a href="tg://user?id={telegram_master().me.id}">@{html.escape(seg.data["user_name"])}</a>'
-            case "face":
-                text += f"[face:{seg.data['face_id']}]"
-            case "market_face":
-                text += f"[market_face:{seg.data['face_name']}]"
-            case "image":
-                text += f"[image]"
-                media.append(InputMediaPhoto(await seg.download(nonebot.get_bot())))
-            case "file":
-                print(seg.data)
-                text += f"[file]"
-                media.append(InputMediaDocument(await seg.download(nonebot.get_bot())))
-            case "voice":
-                print(seg.data)
-                text += f"[voice]"
-                media.append(InputMediaAudio(await seg.download(nonebot.get_bot())))
-            case "video":
-                print(seg.data)
-                text += f"[video]"
-                media.append(InputMediaVideo(await seg.download(nonebot.get_bot())))
-            # case "json":
-            #     data = json.loads(seg.data['data'])
-            #     match data['app']:
-            #         case "com.tencent.miniapp_01":
-            #             text += f"[{data['meta']['detail_1']['qqdocurl']}]"
-            #         case "com.tencent.structmsg":
-            #             """[CQ:json,data={"app":"com.tencent.structmsg"&#44;"config":{"ctime":1695301163&#44;"forward":true&#44;"token":"57a15aa133fa8ea922e5c21c0ae68c85"&#44;"type":"normal"}&#44;"desc":"音乐"&#44;"extra":{"app_type":1&#44;"appid":100495085&#44;"msg_seq":7281263043479285785&#44;"uin":627696862}&#44;"meta":{"music":{"action":""&#44;"android_pkg_name":""&#44;"app_type":1&#44;"appid":100495085&#44;"ctime":1695301163&#44;"desc":"ずっと真夜中でいいのに。"&#44;"jumpUrl":"https://y.music.163.com/m/song?id=1399788801&amp;uct2=eSp1d2IlPa4DIaUNQvk03w%3D%3D&amp;dlt=0846&amp;app_version=8.10.71"&#44;"musicUrl":"http://music.163.com/song/media/outer/url?id=1399788801&amp;userid=45803009&amp;sc=wm&amp;tn="&#44;"preview":"https://p1.music.126.net/jWFFWk-XoYFTVh09nWjBGg==/109951165005758203.jpg?imageView=1&amp;thumbnail=1440z3088&amp;type=webp&amp;quality=80"&#44;"sourceMsgId":"0"&#44;"source_icon":"https://i.gtimg.cn/open/app_icon/00/49/50/85/100495085_100_m.png"&#44;"source_url":""&#44;"tag":"网易云音乐"&#44;"title":"Dear Mr 「F」 (亲爱的F先生)"&#44;"uin":627696862}}&#44;"prompt":"&#91;分享&#93;Dear Mr 「F」 (亲爱的F先生)"&#44;"ver":"0.0.0.1"&#44;"view":"music"}]"""
-            #             text += f"[{data['meta']['news']['jumpUrl']}]"
-            #         case _:
-            #             logger.warning(f"unsupported json app {repr(data)}")
-            #             text += f"[json/{data['app']}]"
-            case _:
-                text += f"[{seg.type}]"
-                logger.warning(f"unsupported message segment {repr(seg)}")
-    return (text, media)
+        try:
+            match seg.type:
+                case "text":
+                    text += seg.data['text']
+                case "at":
+                    text += f"@{seg.data['qq']} "
+                case "face":
+                    if int(seg.data['id']) in qq_emoji_text_list:
+                        text += f"[{qq_emoji_text_list[int(seg.data['id'])]}]"
+                    else:
+                        text += f"[face:{seg.data['id']}]"
+                case "mface":
+                    text += f"[mface]"
+                case "image":
+                    text += "[image]"
+                    data = await download_file(seg.data['url'])
+                    if not data:
+                        text += "[error: failed to download image]"
+                        logger.error(f"failed to download image {seg.data['url']}")
+                    else:
+                        meta = iio.immeta(data, plugin="pyav")
+                        if meta['codec'] == "gif":
+                            entities += tg.message.File.animation(("image.gif", data))
+                        else:
+                            entities += tg.message.File.photo(data)
+                case "record":
+                    text += "[record]"
+                    data = await download_file(seg.data['url'])
+                    entities += tg.message.File.voice(data)
+                case "video":
+                    text += "[video]"
+                    data = await download_file(seg.data['url'])
+                    entities += tg.message.File.video(data)
+                case "file":
+                    text += "[file]"
+                    data = await download_file(seg.data['url'])
+                    entities += tg.message.File.document((seg.data['name'], data))
+                case "json":
+                    data = json.loads(seg.data['data'])
+                    match data['app']:
+                        case "com.tencent.miniapp_01":
+                            text += f"[miniapp]{data['meta']['detail_1']['qqdocurl']}"
+                        # case "com.tencent.structmsg":
+                        #     text += f"[structmsg]{data['meta']['news']['jumpUrl']}"
+                        case _:
+                            logger.warning(f"unsupported json app {repr(data)}")
+                            text += f"[json]\n{json.dumps(data, ensure_ascii=False, indent=2)}"
+                case _:
+                    text += f"[{seg.type}]"
+                    logger.warning(f"unsupported message segment {repr(seg)}")
+        except Exception as e:
+            text += f"\n[ERROR]\n{repr(e)}\non {repr(seg)}\n[\ERROR]"
+            traceback.print_exc()
+    return text, entities
 
 
-@on().handle()
-async def handle_message(event: MessageEvent, bot: Bot):
-    # pprint(event.dict())
-    match event.get_event_name():
-        case "message.group":
-            message = event.get_message()
-            unique_id = -int(event.peerUin)
-            name = event.sendMemberName or event.sendNickName
-            forum_topic_id = await get_forum_topic(unique_id, event.peerName)
-            reply_to_message = db.select_message_where_qq(unique_id, int(event.reply.replayMsgSeq)) if event.reply else None
+async def handle_message(event: v11.event.MessageEvent, qq_unique_id: int, forum_topic_id: int, name: str):
+    message = event.get_message()
+    print(repr(message))
 
-            text, media = await convert_message(message)
-            text = f"<u><b>{name}</b>:</u>\n" + text
-            tg_message = await tg_send_message(text, media, reply_to_message, forum_topic_id)
-            db.insert_message(DBMessage(unique_id, int(event.msgSeq), tg_message.from_user.id, forum_topic_id, tg_message.message_id))
-        case "message.private":
-            message = event.get_message()
-            unique_id = int(event.peerUin)
-            name = event.sendNickName
-            forum_topic_id = await get_forum_topic(event.peerUin, name)
-            reply_to_message = db.select_message_where_qq(unique_id, int(event.reply.replayMsgSeq)) if event.reply else None
+    if event.reply:
+        reply_to_message = db.select_message_where_qq(qq_unique_id, event.reply.message_id)
+    elif reply_seg := [seg for seg in message if seg.type == "reply"]:
+        reply_to_message = db.select_message_where_qq(qq_unique_id, reply_seg[0].data["id"])
+    else:
+        reply_to_message = None
+        reply_tg_bot_id = None
+        reply_tg_msg_id = None
 
-            text, media = await convert_message(message)
-            tg_message = await tg_send_message(text, media, reply_to_message, forum_topic_id)
-            db.insert_message(DBMessage(unique_id, int(event.msgSeq), tg_message.from_user.id, forum_topic_id, tg_message.message_id))
-        case _:
-            logger.warning(f"unsupported event {str(event)}")
-
-
-telegrams = [TelegramApp(token, driver.config.chat_id)
-             for token in driver.config.telegram_tokens]
-
-def telegram_load_balance():
-    return sorted(telegrams, key=lambda t: t.last_send_timestamp)[0]
-
-def telegram_master():
-    return telegrams[0]
-
-def telegram_by_id(id: int):
-    for tg in telegrams:
-        if tg.me.id == id:
-            return tg
-    return None
-
-async def tg_send_message(text, media, reply_to_message: DBMessage, message_thread_id, *args, **kwargs):
-    if not text:
-        text = "(empty)"
-    reply_to_message_id = None
     if reply_to_message:
-        tg = telegram_by_id(reply_to_message.tg_bot_id)
-        reply_to_message_id = reply_to_message.tg_message_id
+        reply_tg_bot_id = reply_to_message.tg_bot_id
+        reply_tg_msg_id = reply_to_message.tg_msg_id
+
+
+    text, entities = await convert_message(message)
+    if event.reply:
+        text = "[reply]" + text
+    converted_message = entities + tg.message.Entity.underline(name + ": ") + "\n" + text
+
+    tg_bot = telegram_load_balance(reply_tg_bot_id)
+    tg_messages = await tg_bot.send_to(driver.config.chat_id, converted_message, message_thread_id=forum_topic_id, reply_to_message_id=reply_tg_msg_id)
+    if isinstance(tg_messages, list):
+        for tg_message in tg_messages:
+            db.insert_message(DB.Message(qq_unique_id, event.message_id, int(tg_bot.self_id), forum_topic_id, tg_message.message_id))
     else:
-        tg = telegram_load_balance()
-    if media:
-        msgs = await tg.send_media_group(media,
-                                    reply_to_message_id=reply_to_message_id,
-                                    message_thread_id=message_thread_id,
-                                    caption=text,
-                                    parse_mode=telegram.constants.ParseMode.HTML, 
-                                    *args, **kwargs)
-        return msgs[0]
+        tg_message = tg_messages
+        db.insert_message(DB.Message(qq_unique_id, event.message_id, int(tg_bot.self_id), forum_topic_id, tg_message.message_id))
+
+
+@on(rule=is_type(v11.event.GroupMessageEvent), block=True).handle()
+async def handle_group_message(event: v11.event.GroupMessageEvent, bot: v11.Bot):
+    try:
+        qq_unique_id = -event.group_id  # negative id for groups
+        name = event.sender.card or event.sender.nickname
+        group_info = await get_group_info(bot, event.group_id)
+        forum_topic_id = await get_forum_topic(qq_unique_id, group_info['group_name'])
+        await handle_message(event, qq_unique_id, forum_topic_id, name)
+    except Exception as e:
+        error_msg = f"\n[ERROR]\n{repr(e)}\non {repr(event)}\n[\ERROR]"
+        await telegram_master().send_to(driver.config.chat_id, error_msg)
+        traceback.print_exc()
+
+
+@on(rule=is_type(v11.event.PrivateMessageEvent), block=True).handle()
+async def handle_private_message(event: v11.event.PrivateMessageEvent, bot: v11.Bot):
+    try:
+        qq_unique_id = event.sender.user_id
+        name = event.sender.card or event.sender.nickname
+        forum_topic_id = await get_forum_topic(qq_unique_id, name)
+        await handle_message(event, qq_unique_id, forum_topic_id, name)
+    except Exception as e:
+        error_msg = f"\n[ERROR]\n{repr(e)}\non {repr(event)}\n[\ERROR]"
+        await telegram_master().send_to(driver.config.chat_id, error_msg)
+        traceback.print_exc()
+
+
+@on(rule=is_type(v11.event.HeartbeatMetaEvent), block=True).handle()
+async def handle_heartbeat_message(event: v11.Event, bot: v11.Bot):
+    logger.info(f"received heartbeat {repr(event)}")
+
+
+@on(rule=is_type(v11.Event), priority=10).handle()
+async def handle_v11_message(event: v11.Event, bot: v11.Bot):
+    logger.warning(f"unsupported event {repr(event)}")
+
+
+@on_command("id", rule=is_type(tg.event.GroupMessageEvent) & is_telegram_master, block=True).handle()
+async def handle_ls(event: tg.event.GroupMessageEvent, bot: tg.Bot):
+    await bot.send(event, f"{event.chat.id}")
+
+
+@on_command("ls", rule=is_type(tg.event.GroupMessageEvent) & is_telegram_master, block=True).handle()
+async def handle_ls(event: tg.event.GroupMessageEvent, bot: tg.Bot):
+    friend_list = await v11_bot().call_api("get_friend_list")
+    formatted = "FRIENDS:\n"
+    for friend in friend_list:
+        formatted += f"{friend['user_remark'] or friend['user_name']}({friend['user_id']})"
+        formatted += "\n"
+    group_list = await v11_bot().call_api("get_group_list")
+    formatted += "\n\nGROUPS:\n"
+    for group in group_list:
+        formatted += f"{group['group_name']}({-group['group_id']})"
+        formatted += "\n"
+    await bot.send(event, formatted)
+
+
+@on_command("touch", rule=is_type(tg.event.GroupMessageEvent) & is_telegram_master, block=True).handle()
+async def handle_touch(event: tg.event.GroupMessageEvent, bot: tg.Bot, message: tg.Message = CommandArg()):
+    if user_id := message.extract_plain_text():
+        if user_id.startswith("-"):
+            group_list = await v11_bot().call_api("get_group_list")
+            for group in group_list:
+                if str(-group['group_id']) == user_id:
+                    forum_topic_id = await get_forum_topic(-group['group_id'], group['group_name'])
+                    await bot.send(event, f"successfully created topic {forum_topic_id}")
+                    break
+            else:
+                await bot.send(event, f"failed to create forum topic for {user_id}")
+        else:
+            friend_list = await v11_bot().call_api("get_friend_list")
+            for friend in friend_list:
+                if str(friend['user_id']) == user_id:
+                    forum_topic_id = await get_forum_topic(friend['user_id'], friend['user_remark'] or friend['user_name'])
+                    await bot.send(event, f"successfully created topic {forum_topic_id}")
+                    break
+            else:
+                await bot.send(event, f"failed to create forum topic for {user_id}")
     else:
-        return await tg.send_message(text, 
-                                    parse_mode=telegram.constants.ParseMode.HTML, 
-                                    reply_to_message_id=reply_to_message_id,
-                                    message_thread_id=message_thread_id,
-                                    *args, **kwargs)
+        await bot.send(event, "Usage: /touch USER_ID or /touch -GROUP_ID")
 
 
-@telegram_master().handle_command("chat_id")
-async def _(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_message(update.effective_chat.id, 
-                                   f"{update.effective_chat.id}", 
-                                   reply_to_message_id=update.message.id, 
-                                   message_thread_id=update.message.message_thread_id)
+@on(rule=is_type(tg.event.ForumTopicMessageEvent) & is_telegram_master, block=True).handle()
+async def handle_topic_message(event: tg.event.ForumTopicMessageEvent, bot: tg.Bot):
+    forum_topic_id = event.message_thread_id
+    qq_unique_id = db.select_qq_unique_id(tg_forum_topic_id=forum_topic_id)
 
-@telegram_master().handle_command("list_friend")
-async def _(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bot: Bot = nonebot.get_bot()
-    friend_list = await bot.get_friends()
-    print(friend_list)
-    formatted = '\n'.join([f"{friend.uin} {friend.remark or friend.nick}" for friend in friend_list])
-    await context.bot.send_message(update.effective_chat.id, 
-                                   formatted, 
-                                   reply_to_message_id=update.message.id, 
-                                   message_thread_id=update.message.message_thread_id)
+    converted_message = ""
+    for seg in event.get_message():
+        match seg.type:
+            case _ if seg.is_text():
+                converted_message += seg.data.get("text", "")
+            case "photo":
+                file = await bot.get_file(file_id=seg.data["file"])
+                url = f"https://api.telegram.org/file/bot{bot.bot_config.token}/{file.file_path}"
+                data = await download_file(url)
+                converted_message += v11.message.MessageSegment.image(data)
+            case "video":
+                file = await bot.get_file(file_id=seg.data["file"])
+                url = f"https://api.telegram.org/file/bot{bot.bot_config.token}/{file.file_path}"
+                data = await download_file(url)
+                # converted_message += v11.message.MessageSegment.video(data)
+            case "document":
+                file = await bot.get_file(file_id=seg.data["file"])
+                url = f"https://api.telegram.org/file/bot{bot.bot_config.token}/{file.file_path}"
+                # print(url)
+                # data = await download_file(url)
+                await v11_bot().call_api("upload_private_file", user_id=qq_unique_id, file=url, name=file.file_path)
+            case "sticker" | "animation":
+                file = await bot.get_file(file_id=seg.data["file"])
+                url = f"https://api.telegram.org/file/bot{bot.bot_config.token}/{file.file_path}"
+                frames = iio.imread(await download_file(url), index=None, plugin="pyav", format="rgba")
+                data = iio.imwrite("<bytes>", frames, extension=".gif", duration=50, loop=0)
+                converted_message += v11.message.MessageSegment.image(data)
+            case _:
+                converted_message += seg.type
 
-@telegram_master().handle_command("list_group")
-async def _(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bot: Bot = nonebot.get_bot()
-    group_list = await bot.get_groups()
-    formatted = '\n'.join([f"{group.groupCode} {group.groupName}" for group in group_list])
-    await context.bot.send_message(update.effective_chat.id, 
-                                   formatted, 
-                                   reply_to_message_id=update.message.id, 
-                                   message_thread_id=update.message.message_thread_id)
-
-# @telegram_master().handle_command("init_friend")
-async def _(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bot = nonebot.get_bot()
-    try:
-        user_id = int(context.args[0])
-        friend_list = await bot.call_api("get_friend_list")
-        username = None
-        for friend in friend_list:
-            if friend['user_id'] == user_id:
-                username = friend['remark'] or friend['nickname']
-                break
-        if not username:
-            raise KeyError
-    except (IndexError, ValueError, KeyError):
-        await context.bot.send_message(update.effective_chat.id, 
-                                       f"bad argument", 
-                                       reply_to_message_id=update.message.id, 
-                                       message_thread_id=update.message.message_thread_id)
+    if not converted_message:
         return
-    
-    forum_topic_id = await get_forum_topic(user_id, username)
-    await context.bot.send_message(update.effective_chat.id, 
-                                   f"successfully created topic {forum_topic_id}", 
-                                   reply_to_message_id=update.message.id, 
-                                   message_thread_id=update.message.message_thread_id)
 
-# @telegram_master().handle_command("init_group")
-async def _(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bot = nonebot.get_bot()
-    try:
-        group_id = int(context.args[0])
-        group_info = await get_group_info(bot, group_id)
-    except (IndexError, ValueError, KeyError):
-        await context.bot.send_message(update.effective_chat.id, 
-                                       f"bad argument", 
-                                       reply_to_message_id=update.message.id, 
-                                       message_thread_id=update.message.message_thread_id)
-        return
-    
-    forum_topic_id = await get_forum_topic(-group_id,  # negative id for groups
-                                            group_info['group_name'])
-    await context.bot.send_message(update.effective_chat.id, 
-                                   f"successfully created topic {forum_topic_id}", 
-                                   reply_to_message_id=update.message.id, 
-                                   message_thread_id=update.message.message_thread_id)
-
-@telegram_master().handle_message(filters.COMMAND)
-async def _(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_message(update.effective_chat.id, 
-                                   "unknown command!", 
-                                   reply_to_message_id=update.message.id, 
-                                   message_thread_id=update.message.message_thread_id)
-
-@telegram_master().handle_message()
-async def _(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bot = nonebot.get_bot()
-    forum_topic_id = update.message.message_thread_id
-    qq_unique_id = db.select_qq_unique_id(forum_topic_id)
-    message = []
-    if update.message.photo:
-        file = await update.message.photo[-1].get_file()
-        data = BytesIO(await file.download_as_bytearray())
-        message.append(MessageSegment.image(data))
-    message.append(MessageSegment.text(update.message.text or update.message.caption))
-
+    event_dict = {}
     if qq_unique_id > 0:
-        chatType = ChatType.FRIEND
-        peerUin = str(qq_unique_id)
+        event_dict['user_id'] = qq_unique_id
     else:
-        chatType = ChatType.GROUP
-        peerUin = str(-qq_unique_id)
-    msg = await bot.send(None, message, chatType=chatType, peerUin=peerUin)
-    db.insert_message(DBMessage(qq_unique_id, int(msg.msgSeq), telegram_master().me.id, forum_topic_id, update.message.id))
-    logger.info(f"sent {message} to qq, qq message id")
+        event_dict['group_id'] = -qq_unique_id
+    if event.reply_to_message:
+        reply_to_db_message = db.select_message_where_tg(tg_forum_topic_id=forum_topic_id, 
+                                                         tg_msg_id=event.reply_to_message.message_id)
+        if reply_to_db_message:
+            event_dict['message_id'] = reply_to_db_message.qq_msg_id
+    pseudo_event = lambda: None
+    pseudo_event.dict = lambda: event_dict
+
+    res = await v11_bot().send(pseudo_event, converted_message, reply_message='message_id' in event_dict)
+    qq_msg_id = res['message_id']
+    db.insert_message(DB.Message(qq_unique_id, qq_msg_id, int(telegram_master().self_id), forum_topic_id, event.message_id))
+
+
+@on(rule=is_type(tg.Event) & is_telegram_master, priority=10).handle()
+async def handle_tg_message(event: tg.Event, bot: tg.Bot):
+    logger.warning(f"unsupported event {repr(event)}")
+
 
 if __name__ == "__main__":
     nonebot.run()
