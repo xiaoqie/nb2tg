@@ -1,4 +1,5 @@
 import hashlib
+import ssl
 
 import aiohttp
 
@@ -19,8 +20,16 @@ def identicon(n: int):
 
 
 async def download_file(url):
-    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(verify_ssl=False)) as session:
-        async with session.get(url) as resp:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Safari/605.1.15"
+    }
+    # ssl_context = ssl.SSLContext(ssl.PROTOCOL_SSLv2)
+    ssl_context = ssl.create_default_context()
+    ssl_context.options = ssl.PROTOCOL_TLSv1_2
+    ssl_context.set_ciphers("AES128-GCM-SHA256")
+    connector = aiohttp.TCPConnector(ssl_context=ssl_context)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        async with session.get(url, headers=headers) as resp:
             return await resp.read()
 
 

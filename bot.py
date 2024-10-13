@@ -1,7 +1,7 @@
 import asyncio
 import json
+from pathlib import Path
 import time
-import urllib.request
 import traceback
 import imageio.v3 as iio
 import nonebot
@@ -90,27 +90,40 @@ async def convert_message(message: v11.Message):
                 case "image":
                     text += "[image]"
                     data = await download_file(seg.data['url'])
+                    # ret = await v11_bot().call_api("get_image", file=seg.data['file'])
+                    # print(ret)
+                    # data = Path(ret['file']).read_bytes()
                     if not data:
-                        text += "[error: failed to download image]"
+                        text += f"[error: failed to download image {seg.data['url']} ]"
                         logger.error(f"failed to download image {seg.data['url']}")
                     else:
                         meta = iio.immeta(data, plugin="pyav")
                         if meta['codec'] == "gif":
-                            entities += tg.message.File.animation(("image.gif", data))
+                            entities += tg.message.File.document(("image.gif", data))
                         else:
                             entities += tg.message.File.photo(data)
                 case "record":
                     text += "[record]"
-                    data = await download_file(seg.data['url'])
+                    # data = await download_file(seg.data['url'])
+                    # ret = await v11_bot().call_api("get_record", file=seg.data['file'])
+                    # print(ret)
+                    # data = Path(ret['file']).read_bytes()
+                    data = Path(seg.data['path']).read_bytes()
                     entities += tg.message.File.voice(data)
                 case "video":
                     text += "[video]"
-                    data = await download_file(seg.data['url'])
+                    # data = await download_file(seg.data['url'])
+                    # ret = await v11_bot().call_api("get_file", file=seg.data['file_id'])
+                    # print(ret)
+                    data = Path(seg.data['path']).read_bytes()
                     entities += tg.message.File.video(data)
                 case "file":
                     text += "[file]"
-                    data = await download_file(seg.data['url'])
-                    entities += tg.message.File.document((seg.data['name'], data))
+                    # data = await download_file(seg.data['url'])
+                    ret = await v11_bot().call_api("get_file", file=seg.data['file_id'])
+                    print(ret)
+                    data = Path(ret['file']).read_bytes()
+                    entities += tg.message.File.document((seg.data['file'], data))
                 case "json":
                     data = json.loads(seg.data['data'])
                     match data['app']:
@@ -140,12 +153,13 @@ async def handle_message(event: v11.event.MessageEvent, qq_unique_id: int, forum
         reply_to_message = db.select_message_where_qq(qq_unique_id, reply_seg[0].data["id"])
     else:
         reply_to_message = None
-        reply_tg_bot_id = None
-        reply_tg_msg_id = None
 
     if reply_to_message:
         reply_tg_bot_id = reply_to_message.tg_bot_id
         reply_tg_msg_id = reply_to_message.tg_msg_id
+    else:
+        reply_tg_bot_id = None
+        reply_tg_msg_id = None
 
 
     text, entities = await convert_message(message)
@@ -208,11 +222,13 @@ async def handle_ls(event: tg.event.GroupMessageEvent, bot: tg.Bot):
 @on_command("ls", rule=is_type(tg.event.GroupMessageEvent) & is_telegram_master, block=True).handle()
 async def handle_ls(event: tg.event.GroupMessageEvent, bot: tg.Bot):
     friend_list = await v11_bot().call_api("get_friend_list")
+    print(friend_list)
     formatted = "FRIENDS:\n"
     for friend in friend_list:
-        formatted += f"{friend['user_remark'] or friend['user_name']}({friend['user_id']})"
+        formatted += f"{friend['remark'] or friend['nickname']}({friend['user_id']})"
         formatted += "\n"
     group_list = await v11_bot().call_api("get_group_list")
+    print(group_list)
     formatted += "\n\nGROUPS:\n"
     for group in group_list:
         formatted += f"{group['group_name']}({-group['group_id']})"
@@ -236,7 +252,7 @@ async def handle_touch(event: tg.event.GroupMessageEvent, bot: tg.Bot, message: 
             friend_list = await v11_bot().call_api("get_friend_list")
             for friend in friend_list:
                 if str(friend['user_id']) == user_id:
-                    forum_topic_id = await get_forum_topic(friend['user_id'], friend['user_remark'] or friend['user_name'])
+                    forum_topic_id = await get_forum_topic(friend['user_id'], friend['remark'] or friend['nickname'])
                     await bot.send(event, f"successfully created topic {forum_topic_id}")
                     break
             else:
@@ -268,8 +284,6 @@ async def handle_topic_message(event: tg.event.ForumTopicMessageEvent, bot: tg.B
             case "document":
                 file = await bot.get_file(file_id=seg.data["file"])
                 url = f"https://api.telegram.org/file/bot{bot.bot_config.token}/{file.file_path}"
-                # print(url)
-                # data = await download_file(url)
                 await v11_bot().call_api("upload_private_file", user_id=qq_unique_id, file=url, name=file.file_path)
             case "sticker" | "animation":
                 file = await bot.get_file(file_id=seg.data["file"])
@@ -294,7 +308,7 @@ async def handle_topic_message(event: tg.event.ForumTopicMessageEvent, bot: tg.B
         if reply_to_db_message:
             event_dict['message_id'] = reply_to_db_message.qq_msg_id
     pseudo_event = lambda: None
-    pseudo_event.dict = lambda: event_dict
+    pseudo_event.model_dump = lambda *args, **kwargs: event_dict
 
     res = await v11_bot().send(pseudo_event, converted_message, reply_message='message_id' in event_dict)
     qq_msg_id = res['message_id']
